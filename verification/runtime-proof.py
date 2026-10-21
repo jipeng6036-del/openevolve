@@ -22,6 +22,7 @@ def main():
     parser.add_argument("--expect", choices=("baseline", "fixed"), required=True)
     args = parser.parse_args()
     checkout = args.checkout.resolve()
+    args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     source = checkout / "openevolve/utils/code_utils.py"
     records = []
