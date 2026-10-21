@@ -1,0 +1,102 @@
+name: Fence baseline and candidate verification
+
+on:
+  push:
+    branches: [verify/fence-whitespace-ci]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: baseline
+            ref: 59dfe764b5ab4478ac00214432fcac33bbe2bf4b
+            expect: baseline
+          - label: candidate
+            ref: 3587c97a5665dd5542c0d622e00c32f8a18cc50f
+            expect: fixed
+    env:
+      OPENAI_API_KEY: optillm
+      OPTILLM_API_KEY: optillm
+      OPTILLM_MAX_TOKENS: '256'
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: verification
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.ref }}
+          path: source
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+      - name: Install project dependencies
+        run: |
+          mkdir -p evidence
+          git -C source rev-parse HEAD | tee evidence/source-commit.txt
+          sha256sum source/openevolve/utils/code_utils.py | tee evidence/source-sha256.txt
+          python -m pip install --upgrade pip
+          python -m pip install -e './source[dev]'
+          python -m pip freeze > evidence/unit-dependencies.txt
+      - name: Run all unit tests from the repository workflow
+        working-directory: source
+        env:
+          OPENAI_API_KEY: test
+          PYTHONPATH: ${{ github.workspace }}/verification/verification/network-guard
+        run: |
+          set -o pipefail
+          python -m unittest discover -s tests -p 'test_*.py' -v 2>&1 | tee ../evidence/unit-tests.log
+      - name: Exercise actual CLI, workers, evaluator, and checkpoint files
+        env:
+          PYTHONPATH: ${{ github.workspace }}/verification/verification/network-guard
+        run: |
+          python verification/verification/runtime-proof.py --checkout source --output evidence/runtime --expect '${{ matrix.expect }}'
+      - name: Install actual local-model integration dependencies
+        run: |
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -m pip install optillm math-verify
+          python -m pip freeze > evidence/integration-dependencies.txt
+      - name: Cache public model weights
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: fence-verification-hf-codelion-dhara-250m
+      - name: Start the repository's real local model server
+        run: |
+          optillm --model codelion/dhara-250m --port 8000 > evidence/optillm-server.log 2>&1 &
+          echo $! > evidence/server.pid
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8000/health >/dev/null; then
+              break
+            fi
+            if ! kill -0 "$(cat evidence/server.pid)" 2>/dev/null; then
+              cat evidence/optillm-server.log
+              exit 1
+            fi
+            sleep 10
+          done
+          curl -sf http://localhost:8000/health | tee evidence/server-health.json
+      - name: Run the entire required integration suite, including real LLM tests
+        working-directory: source
+        run: |
+          set -o pipefail
+          pytest tests/integration -v --tb=short --junitxml=../evidence/integration.xml 2>&1 | tee ../evidence/integration-tests.log
+      - name: Stop only this job's model server
+        if: always()
+        run: |
+          if [ -f evidence/server.pid ]; then
+            kill "$(cat evidence/server.pid)" || true
+          fi
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fence-verification-${{ matrix.label }}
+          path: evidence

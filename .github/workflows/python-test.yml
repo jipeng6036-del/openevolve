@@ -1,6 +1,9 @@
 name: Tests
 
-on: [push, pull_request]
+on:
+  push:
+    branches-ignore: ['verify/**']
+  pull_request:
 
 jobs:
   unit-tests:
